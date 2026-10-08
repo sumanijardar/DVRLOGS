@@ -40,24 +40,44 @@ from pymysql.cursors import DictCursor
 from dbutils.pooled_db import PooledDB
 
 # ==================================================================== #
-#                          CONFIGURATION                               #
+#                     USER CONFIGURATION & SETTINGS                    #
 # ==================================================================== #
 
+# 1. Scheduler Mode: Set True to run continuously in background loop, False for a single run
+ENABLE_AUTO_SCHEDULER    = True     # 🔁 True = Run continuously on schedule, False = Single run
+SCHEDULER_INTERVAL_HOURS = 2        # ⏱️ Run synchronization cycle every 2 Hours (7200s)
+
+# 2. Lookback Window: Number of past hours of logs to fetch from DVR
+LOOKBACK_HOURS           = 2        # 🕒 Fetch logs from the last 2 Hours (e.g. 2, 5, 24, 72)
+DEFAULT_LOOKBACK_HOURS   = LOOKBACK_HOURS
+
+# 3. Event Types to Fetch:
+# Options: ["all"] | ["motion"] | ["network"] | ["login"] | ["hdd"] | ["video_loss"] | ["exception"]
+EVENT_FILTERS            = ["all"]  # 🎯 Default: Fetch all log event categories
+
+# 4. Target Site Mode:
+# None = All Active Hikvision Sites (Batch Mode)
+# "172.17.17.44" = Target only this specific DVR IP address
+TARGET_IP                = None     # 📍 Example: "172.17.17.44" or None for all sites
+
+# 5. Interactive CLI Prompt:
+ENABLE_INTERACTIVE_MENU  = False    # 🚫 False = Run directly without prompts, True = Prompt in terminal
+
+# 6. Max Records & Performance Settings:
+DEFAULT_MAX_RECORDS      = 5000     # Maximum log records per DVR per cycle
+MAX_SITE_THREADS         = 50       # Parallel worker threads for batch sync
+DB_MAX_CONNECTIONS       = 70       # MySQL connection pool size
+
+# Database connection settings
 DB_HOST = "localhost"
 DB_USER = "root"
 DB_PASS = ""
 DB_NAME = "esurv"
 
-MAX_SITE_THREADS    = 50     # Parallel threads for batch mode
-DB_MAX_CONNECTIONS  = 70     # Pool connections
-CYCLE_SLEEP_SECONDS = 1800   # Sleep 30m between batch cycles
-
 # Network timeouts (seconds)
 T_PING          = 9
 T_LOG_FETCH     = 15
-
-DEFAULT_LOOKBACK_HOURS = 5    # Default lookback window (hours)
-DEFAULT_MAX_RECORDS    = 2000 # Default max records per DVR
+CYCLE_SLEEP_SECONDS = int(SCHEDULER_INTERVAL_HOURS * 3600)  # Calculated sleep in seconds
 
 # ==================================================================== #
 #                        POOL / LOCKS / GLOBALS                        #
@@ -111,8 +131,10 @@ def db_execute(sql, params=None, fetch=False, many=False):
         with conn.cursor() as cur:
             if many:
                 cur.executemany(sql, params or [])
+            elif params is not None:
+                cur.execute(sql, params)
             else:
-                cur.execute(sql, params or ())
+                cur.execute(sql)
             if fetch:
                 return cur.fetchall()
             conn.commit()
@@ -139,6 +161,7 @@ def init_log_database():
         id INT AUTO_INCREMENT PRIMARY KEY,
         ipaddress VARCHAR(50) NOT NULL,
         atmid VARCHAR(50) DEFAULT NULL,
+        dvrname VARCHAR(100) DEFAULT NULL,
         log_time DATETIME NOT NULL,
         major_type VARCHAR(100) DEFAULT NULL,
         minor_type VARCHAR(100) DEFAULT NULL,
@@ -151,6 +174,7 @@ def init_log_database():
         INDEX idx_log_time (log_time),
         INDEX idx_ipaddress (ipaddress),
         INDEX idx_atmid (atmid),
+        INDEX idx_dvrname (dvrname),
         INDEX idx_major_type (major_type),
         UNIQUE KEY unique_log_idx (ipaddress, log_time, major_type(50), minor_type(50))
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -161,6 +185,8 @@ def init_log_database():
         # Verify columns exist, add if missing (for backward compatibility)
         cols_info = db_execute("DESCRIBE dvr_fetched_logs;", fetch=True)
         existing_cols = [c['Field'] for c in cols_info] if cols_info else []
+        if "dvrname" not in existing_cols:
+            db_execute("ALTER TABLE dvr_fetched_logs ADD COLUMN dvrname VARCHAR(100) DEFAULT NULL AFTER atmid;")
         if "user_name" not in existing_cols:
             db_execute("ALTER TABLE dvr_fetched_logs ADD COLUMN user_name VARCHAR(50) DEFAULT NULL AFTER source_ip;")
         if "raw_meta_id" not in existing_cols:
@@ -189,31 +215,38 @@ def init_log_database():
 # ==================================================================== #
 
 def get_hikvision_sites(target_ip=None):
+    """Fetches Hikvision sites from database tables."""
     if target_ip:
         sites = db_execute("""
-            SELECT SN, atmid, ipaddress, port, username, password
+            SELECT SN, atmid, IPAddress AS ipaddress, port, UserName AS username, Password AS password, dvrname
             FROM all_dvr_live
-            WHERE ipaddress = %s
+            WHERE IPAddress = %s
         """, (target_ip,), fetch=True)
         if not sites:
             sites = db_execute("""
-                SELECT SN, atmid, ipaddress, port, username, password
-                FROM sites_safe
-                WHERE ipaddress = %s
+                SELECT SN, ATMID AS atmid, DVRIP AS ipaddress, COALESCE(dvr_port, router_port, 81) AS port, UserName AS username, Password AS password, DVRName AS dvrname
+                FROM sites
+                WHERE DVRIP = %s
             """, (target_ip,), fetch=True)
         return sites or []
 
     sites = db_execute("""
-        SELECT SN, atmid, ipaddress, port, username, password
+        SELECT SN, atmid, IPAddress AS ipaddress, port, UserName AS username, Password AS password, dvrname
         FROM all_dvr_live
-        WHERE dvrname = 'hikvision' AND live = 'Y'
+        WHERE LOWER(dvrname) LIKE '%hikvision%' 
+          AND IPAddress IS NOT NULL 
+          AND TRIM(IPAddress) != ''
+          AND live = 'Y'
     """, fetch=True)
 
     if not sites:
         sites = db_execute("""
-            SELECT SN, atmid, ipaddress, port, username, password
-            FROM sites_safe
-            WHERE dvrname = 'hikvision' AND live = 'Y'
+            SELECT SN, ATMID AS atmid, DVRIP AS ipaddress, COALESCE(dvr_port, router_port, 81) AS port, UserName AS username, Password AS password, DVRName AS dvrname
+            FROM sites
+            WHERE LOWER(DVRName) LIKE '%hikvision%' 
+              AND DVRIP IS NOT NULL 
+              AND TRIM(DVRIP) != ''
+              AND live = 'Y'
         """, fetch=True)
     return sites or []
 
@@ -463,33 +496,37 @@ class HikvisionLogFetcher:
 
 def build_log_card(ip, atm_id, status, message, fetched_count=0, saved_count=0):
     """Returns a clean console output status card."""
+    ip_str = str(ip or 'Unknown')
     card = [
         "=" * 70,
-        f"HIKVISION LOG SYNC | IP: {ip:<15} | ATM ID: {atm_id or 'N/A'}",
+        f"📜  HIKVISION LOG SYNC | IP: {ip_str:<15} | ATM ID: {atm_id or 'N/A'}",
         "-" * 70,
-        f"  Status       : {status}",
-        f"  Message      : {message}",
+        f"  📶 Status       : {status}",
+        f"  💬 Message      : {message}",
     ]
-    if status == "SUCCESS":
-        card.append(f"  Fetched Logs : {fetched_count} entries")
-        card.append(f"  Inserted     : {saved_count} new entries (duplicates auto-ignored)")
+    if status == "✅ Success" or status == "SUCCESS":
+        card.append(f"  📥 Fetched Logs : {fetched_count} entries")
+        card.append(f"  💾 Inserted     : {saved_count} new entries (duplicates auto-ignored)")
     card.append("=" * 70)
     return "\n".join(card)
 
 
 def process_site_logs(site, lookback_hours=DEFAULT_LOOKBACK_HOURS, event_filters=None, max_records=DEFAULT_MAX_RECORDS, is_single=False):
-    ip = site.get("ipaddress")
+    ip = str(site.get("ipaddress") or "").strip()
+    if not ip:
+        return False
     port = site.get("port") or 81
     user = site.get("username")
     pwd = site.get("password")
     atm_id = str(site.get("atmid", "") or "").replace(" ", "")
+    dvr_name = str(site.get("dvrname") or "HIKVISION").strip()
 
     fetcher = HikvisionLogFetcher(ip, port, user, pwd)
 
     try:
         # 1. Ping Check
         if not fetcher.check_ping():
-            safe_print(build_log_card(ip, atm_id, "OFFLINE", "Device ping timeout."))
+            safe_print(build_log_card(ip, atm_id, "❌ Offline", "Device ping timeout."))
             return False
 
         # 2. Lookback time range
@@ -502,7 +539,7 @@ def process_site_logs(site, lookback_hours=DEFAULT_LOOKBACK_HOURS, event_filters
         # 3. Fetch from DVR with event filter
         success, err_msg, logs_list = fetcher.fetch_logs(start_time, end_time, event_filters=event_filters, max_records=max_records)
         if not success:
-            safe_print(build_log_card(ip, atm_id, "API FAILED", f"{err_msg} ({message})"))
+            safe_print(build_log_card(ip, atm_id, "❌ API Failed", f"{err_msg} ({message})"))
             return False
 
         # 4. Insert logs into MySQL database using INSERT IGNORE (relies on UNIQUE KEY)
@@ -510,15 +547,16 @@ def process_site_logs(site, lookback_hours=DEFAULT_LOOKBACK_HOURS, event_filters
         if logs_list:
             insert_sql = """
                 INSERT IGNORE INTO dvr_fetched_logs 
-                (ipaddress, atmid, log_time, major_type, minor_type, description, source_ip, user_name, raw_meta_id, raw_xml)
-                VALUES (%(ipaddress)s, %(atmid)s, %(log_time)s, %(major_type)s, %(minor_type)s, %(description)s, %(source_ip)s, %(user_name)s, %(raw_meta_id)s, %(raw_xml)s)
+                (ipaddress, atmid, dvrname, log_time, major_type, minor_type, description, source_ip, user_name, raw_meta_id, raw_xml)
+                VALUES (%(ipaddress)s, %(atmid)s, %(dvrname)s, %(log_time)s, %(major_type)s, %(minor_type)s, %(description)s, %(source_ip)s, %(user_name)s, %(raw_meta_id)s, %(raw_xml)s)
             """
             for log in logs_list:
                 log["atmid"] = atm_id
+                log["dvrname"] = dvr_name
 
             saved_count = db_execute(insert_sql, logs_list, many=True)
 
-        safe_print(build_log_card(ip, atm_id, "SUCCESS", message, len(logs_list), saved_count))
+        safe_print(build_log_card(ip, atm_id, "✅ Success", message, len(logs_list), saved_count))
 
         # If single site mode, display detailed log table in console
         if is_single and logs_list:
@@ -536,7 +574,7 @@ def process_site_logs(site, lookback_hours=DEFAULT_LOOKBACK_HOURS, event_filters
         return True
 
     except Exception as e:
-        safe_print(f"[ERROR] process_site_logs Exception for {ip}: {e}")
+        safe_print(f"❌ process_site_logs Exception for {ip}: {e}")
         return False
     finally:
         fetcher.close()
@@ -549,19 +587,19 @@ def process_site_logs(site, lookback_hours=DEFAULT_LOOKBACK_HOURS, event_filters
 def prompt_user_filters():
     print("""
 ============================================================
- STEP 1: SELECT TIME RANGE (HOW MANY HOURS OF LOGS?)
+ 🕒 STEP 1: SELECT LOG LOOKBACK TIME WINDOW
 ============================================================
- [1] Last 1 Hour
- [2] Last 3 Hours
- [3] Last 5 Hours  - [Default]
- [4] Last 12 Hours
- [5] Last 24 Hours (1 Day)
- [6] Last 48 Hours (2 Days)
- [7] Last 7 Days
- [8] Custom Hours (Enter manually)
+ [1] Past 1 Hour
+ [2] Past 3 Hours
+ [3] Past 5 Hours  - [Default]
+ [4] Past 12 Hours
+ [5] Past 24 Hours (1 Day)
+ [6] Past 48 Hours (2 Days)
+ [7] Past 7 Days
+ [8] Custom Hours Input
 """)
     try:
-        t_choice = input("Enter your choice (1-8) [Default: 3]: ").strip()
+        t_choice = input("Enter Choice (1-8) [Default: 3]: ").strip()
     except (EOFError, KeyboardInterrupt):
         t_choice = "3"
 
@@ -584,23 +622,23 @@ def prompt_user_filters():
     else:
         hours = hours_map.get(t_choice, DEFAULT_LOOKBACK_HOURS)
 
-    print(f"-> Selected: Last {hours} Hours\n")
+    print(f"-> Selected: Past {hours} Hours\n")
 
     print("""
 ============================================================
- STEP 2: SELECT EVENT TYPE TO FETCH
+ 🎯 STEP 2: SELECT EVENT FILTER
 ============================================================
- [1] All Events (Fetch Everything) - [Default]
- [2] Motion Detection (Motion Start / Stop)
- [3] Network Disconnects (Net Broken / LAN)
- [4] User Login / Operations (Admin logins, Settings)
- [5] Hard Disk & System Health (S.M.A.R.T Info / Run Status)
- [6] Video Loss / Camera Tampering
- [7] System Exceptions (All Exception Errors)
- [8] Multiple Choice / Custom Filter (e.g. 2,3,5)
+ [1] All Events (Full DVR Logs) - [Default]
+ [2] 🚨 Motion Detection (Motion Start / Stop)
+ [3] ⚠️ Network Disconnects (Net Broken / LAN / Disconnect)
+ [4] 👤 User Login / Operations (Admin logins, Settings, Account)
+ [5] 💾 Hard Disk & System Health (S.M.A.R.T Info / Storage / Disk)
+ [6] 📹 Video Loss / Camera Tampering
+ [7] ❌ System Exceptions (All Exception Errors & Alarms)
+ [8] Multiple Selection / Custom Filter (e.g. 2,3,5)
 """)
     try:
-        e_choice = input("Enter your choice (1-8) [Default: 1]: ").strip()
+        e_choice = input("Enter Choice (1-8) [Default: 1]: ").strip()
     except (EOFError, KeyboardInterrupt):
         e_choice = "1"
 
@@ -647,13 +685,13 @@ def prompt_user_filters():
 
     print("""
 ============================================================
- STEP 3: SELECT TARGET SITES
+ 📍 STEP 3: SELECT TARGET SITE MODE
 ============================================================
- [1] All Sites (Batch Sync) - [Default]
- [2] Single IP Test
+ [1] All Hikvision Sites (Batch Sync) - [Default]
+ [2] Single IP Test Mode
 """)
     try:
-        s_choice = input("Enter your choice (1-2) [Default: 1]: ").strip()
+        s_choice = input("Enter Choice (1-2) [Default: 1]: ").strip()
     except (EOFError, KeyboardInterrupt):
         s_choice = "1"
 
@@ -673,35 +711,34 @@ def prompt_user_filters():
 
 def main():
     parser = argparse.ArgumentParser(description="Hikvision DVR Log Fetcher & DB Sync")
-    parser.add_argument("--ip", "-i", type=str, help="Target a specific DVR IP address (e.g. --ip 172.17.17.44)")
-    parser.add_argument("--hours", "-H", type=int, help="Lookback hours to fetch (e.g. --hours 6)")
+    parser.add_argument("--ip", "-i", type=str, default=TARGET_IP, help="Target a specific DVR IP address")
+    parser.add_argument("--hours", "-H", type=int, default=LOOKBACK_HOURS, help=f"Lookback hours to fetch (default: {LOOKBACK_HOURS})")
     parser.add_argument("--events", "-e", type=str, help="Event filter comma-separated (e.g. --events motion,network,login,hdd,all)")
     parser.add_argument("--limit", "-l", type=int, default=DEFAULT_MAX_RECORDS, help=f"Max log records to fetch (default: {DEFAULT_MAX_RECORDS})")
-    parser.add_argument("--auto", "-a", action="store_true", help="Run automatically in scheduler mode without interactive prompts")
-    parser.add_argument("--menu", "-m", action="store_true", help="Open interactive selection menu")
+    parser.add_argument("--auto", "-a", action="store_true", default=ENABLE_AUTO_SCHEDULER, help="Run automatically in scheduler mode")
+    parser.add_argument("--menu", "-m", action="store_true", default=ENABLE_INTERACTIVE_MENU, help="Open interactive selection menu")
     args = parser.parse_args()
 
     init_log_database()
 
-    # Determine execution mode
-    hours = args.hours
-    events = [e.strip().lower() for e in args.events.split(",")] if args.events else None
-    target_ip = args.ip.strip() if args.ip else None
-
-    # Check if we should show the interactive menu
-    if (args.menu or (not args.auto and not args.ip and not args.hours and not args.events and sys.stdin.isatty())):
-        hours, events, target_ip = prompt_user_filters()
+    # Determine execution settings from CLI or Config
+    hours = args.hours if args.hours is not None else LOOKBACK_HOURS
+    if args.events:
+        events = [e.strip().lower() for e in args.events.split(",")]
     else:
-        if hours is None:
-            hours = DEFAULT_LOOKBACK_HOURS
-        if events is None:
-            events = ["all"]
+        events = EVENT_FILTERS or ["all"]
+    target_ip = args.ip.strip() if args.ip else TARGET_IP
+    auto_loop = args.auto
+
+    # Show interactive menu ONLY if explicitly requested via config or --menu
+    if args.menu and sys.stdin.isatty():
+        hours, events, target_ip = prompt_user_filters()
 
     # SINGLE IP MODE
     if target_ip:
         safe_print(f"\n{'='*70}")
-        safe_print(f"SINGLE SITE INSPECTION MODE: IP {target_ip}")
-        safe_print(f"Time Range: Last {hours} Hours | Filter: {', '.join(events)}")
+        safe_print(f"🎯 SINGLE HIKVISION SITE INSPECTION MODE: IP {target_ip}")
+        safe_print(f"🕒 Time Range: Last {hours} Hours | Filter: {', '.join(events)}")
         safe_print(f"{'='*70}\n")
 
         sites = get_hikvision_sites(target_ip=target_ip)
@@ -715,21 +752,24 @@ def main():
 
     # BATCH SCHEDULER MODE (All Sites)
     filter_label = ", ".join(events) if events else "All Events"
+    cycle_num = 1
+
     while True:
         start_time = datetime.now()
         start_str = start_time.strftime("%Y-%m-%d %H:%M:%S")
 
         safe_print("\n" + "=" * 70)
-        safe_print(f"SCHEDULED HIKVISION DVR LOG FETCH CYCLE STARTED AT {start_str}")
-        safe_print(f"Lookback: Last {hours} Hours | Events Filter: {filter_label}")
+        safe_print(f"🚀 [CYCLE #{cycle_num}] HIKVISION DVR LOG FETCH STARTED AT {start_str}")
+        safe_print(f"🕒 Lookback: Last {hours} Hours | 🎯 Events Filter: {filter_label}")
+        safe_print(f"⏱️ Schedule Interval: Every {SCHEDULER_INTERVAL_HOURS} Hours | 🔁 Auto-Loop: {'ON' if auto_loop else 'OFF'}")
         safe_print("=" * 70 + "\n")
 
         sites = get_hikvision_sites()
 
         if not sites:
-            safe_print("[WARNING] No Active Hikvision sites found in database.")
+            safe_print("⚠️ No Active Hikvision sites found in database.")
         else:
-            safe_print(f"Loaded {len(sites)} sites for log inspection. "
+            safe_print(f"📋 Loaded {len(sites)} Hikvision sites for log inspection. "
                        f"Running with {MAX_SITE_THREADS} parallel threads (Last {hours} hours)...\n")
 
             succ = fail = 0
@@ -743,7 +783,7 @@ def main():
                             fail += 1
                     except Exception as e:
                         fail += 1
-                        safe_print(f"[ERROR] Worker Thread Error: {e}")
+                        safe_print(f"❌ Worker Thread Error: {e}")
 
             end_time = datetime.now()
             duration = round((end_time - start_time).total_seconds(), 1)
@@ -751,25 +791,28 @@ def main():
 
             safe_print("\n".join([
                 "\n" + "=" * 70,
-                "LOG EXTRACTION CYCLE SUMMARY",
+                f"📊 [CYCLE #{cycle_num}] HIKVISION LOG EXTRACTION SUMMARY",
                 "=" * 70,
-                f"  Started At     : {start_str}",
-                f"  Finished At    : {end_time.strftime('%Y-%m-%d %H:%M:%S')} (Duration: {duration}s)",
-                f"  Total Devices  : {len(sites)}",
-                f"  Sync Completed : {succ} DVRs",
-                f"  Sync Failed    : {fail} DVRs",
+                f"  ⏱️  Started At     : {start_str}",
+                f"  ⏱️  Finished At    : {end_time.strftime('%Y-%m-%d %H:%M:%S')} (Duration: {duration}s)",
+                f"  📍 Total Devices  : {len(sites)}",
+                f"  🟢 Sync Completed : {succ} DVRs",
+                f"  🔴 Sync Failed    : {fail} DVRs",
                 "=" * 70,
-                f"  Next log sync at: {next_run}",
+                f"  ⏳ Next log sync at: {next_run} (after {SCHEDULER_INTERVAL_HOURS} hours)",
                 "=" * 70 + "\n",
             ]))
 
-        if not args.auto and not (args.hours or args.events):
-            # If user ran a single batch from terminal, finish cleanly
+        # If user disabled auto scheduler, exit after 1 cycle
+        if not auto_loop:
+            safe_print("ℹ️ Auto-scheduler is OFF. Completed single batch sync.")
             break
 
         elapsed = (datetime.now() - start_time).total_seconds()
         sleep_for = max(60, CYCLE_SLEEP_SECONDS - elapsed)
-        safe_print(f"Sleeping for {int(sleep_for)}s ...\n")
+        safe_print(f"😴 Sleeping for {int(sleep_for)}s ({round(sleep_for/3600, 2)} hrs) until next automated cycle...\n")
+        
+        cycle_num += 1
         time.sleep(sleep_for)
 
 

@@ -39,24 +39,44 @@ from pymysql.cursors import DictCursor
 from dbutils.pooled_db import PooledDB
 
 # ==================================================================== #
-#                          CONFIGURATION                               #
+#                     USER CONFIGURATION & SETTINGS                    #
 # ==================================================================== #
 
+# 1. Scheduler Mode: Set True to run continuously in background loop, False for a single run
+ENABLE_AUTO_SCHEDULER    = True     # 🔁 True = Run continuously on schedule, False = Single run
+SCHEDULER_INTERVAL_HOURS = 2        # ⏱️ Run synchronization cycle every 2 Hours (7200s)
+
+# 2. Lookback Window: Number of past hours of logs to fetch from DVR
+LOOKBACK_HOURS           = 2        # 🕒 Fetch logs from the last 2 Hours (e.g. 2, 5, 24, 72)
+DEFAULT_LOOKBACK_HOURS   = LOOKBACK_HOURS
+
+# 3. Event Types to Fetch:
+# Options: ["all"] | ["motion"] | ["network"] | ["login"] | ["hdd"] | ["video_loss"] | ["exception"]
+EVENT_FILTERS            = ["all"]  # 🎯 Default: Fetch all log event categories
+
+# 4. Target Site Mode:
+# None = All Active CP Plus & Dahua Sites (Batch Mode)
+# "172.17.15.37" = Target only this specific DVR IP address
+TARGET_IP                = None     # 📍 Example: "172.17.15.37" or None for all sites
+
+# 5. Interactive CLI Prompt:
+ENABLE_INTERACTIVE_MENU  = False    # 🚫 False = Run directly without prompts, True = Prompt in terminal
+
+# 6. Max Records & Performance Settings:
+DEFAULT_MAX_RECORDS      = 5000     # Maximum log records per DVR per cycle
+MAX_SITE_THREADS         = 50       # Parallel worker threads for batch sync
+DB_MAX_CONNECTIONS       = 70       # MySQL connection pool size
+
+# Database connection settings
 DB_HOST = "localhost"
 DB_USER = "root"
 DB_PASS = ""
 DB_NAME = "esurv"
 
-MAX_SITE_THREADS    = 50     # Parallel threads for batch mode
-DB_MAX_CONNECTIONS  = 70     # Pool connections
-CYCLE_SLEEP_SECONDS = 1800   # Sleep 30m between batch cycles
-
 # Network timeouts (seconds)
 T_PING          = 3
 T_LOG_FETCH     = 10
-
-DEFAULT_LOOKBACK_HOURS = 5    # Default lookback window (hours)
-DEFAULT_MAX_RECORDS    = 5000 # Default max records per DVR
+CYCLE_SLEEP_SECONDS = int(SCHEDULER_INTERVAL_HOURS * 3600)  # Calculated sleep in seconds
 
 # ==================================================================== #
 #                        POOL / LOCKS / GLOBALS                        #
@@ -366,7 +386,7 @@ def parse_dahua_log_records(res_text: str, ip: str):
                 "description": desc,
                 "source_ip": src_ip_val,
                 "user_name": user_val,
-                "raw_meta_id": f"dahua/{type_val}/{detail_val}"[:250],
+                # "raw_meta_id": f"dahua/{type_val}/{detail_val}"[:250],
                 "raw_xml": raw_snippet
             })
 
@@ -382,7 +402,7 @@ def matches_event_filter(record: dict, filter_keywords: list) -> bool:
         f"{record.get('major_type', '')} "
         f"{record.get('minor_type', '')} "
         f"{record.get('description', '')} "
-        f"{record.get('raw_meta_id', '')} "
+        # f"{record.get('raw_meta_id', '')} "
         f"{record.get('raw_xml', '')}"
     ).lower()
 
@@ -615,9 +635,10 @@ class CPPlusDahuaLogFetcher:
 
 def build_log_card(ip, atm_id, status, message, fetched_count=0, saved_count=0):
     """Returns a clean console output status card."""
+    ip_str = str(ip or 'Unknown')
     card = [
         "=" * 70,
-        f"📜  CP PLUS / DAHUA LOG SYNC | IP: {ip:<15} | ATM ID: {atm_id or 'N/A'}",
+        f"📜  CP PLUS / DAHUA LOG SYNC | IP: {ip_str:<15} | ATM ID: {atm_id or 'N/A'}",
         "-" * 70,
         f"  📶 Status       : {status}",
         f"  💬 Message      : {message}",
@@ -665,8 +686,8 @@ def process_site_logs(site, lookback_hours=DEFAULT_LOOKBACK_HOURS, event_filters
         if logs_list:
             insert_sql = """
                 INSERT IGNORE INTO dvr_fetched_logs 
-                (ipaddress, atmid, dvrname, log_time, major_type, minor_type, description, source_ip, user_name, raw_meta_id, raw_xml)
-                VALUES (%(ipaddress)s, %(atmid)s, %(dvrname)s, %(log_time)s, %(major_type)s, %(minor_type)s, %(description)s, %(source_ip)s, %(user_name)s, %(raw_meta_id)s, %(raw_xml)s)
+                (ipaddress, atmid, dvrname, log_time, major_type, minor_type, description, source_ip, user_name, raw_xml)
+                VALUES (%(ipaddress)s, %(atmid)s, %(dvrname)s, %(log_time)s, %(major_type)s, %(minor_type)s, %(description)s, %(source_ip)s, %(user_name)s, %(raw_xml)s)
             """
             for log in logs_list:
                 log["atmid"] = atm_id
@@ -705,19 +726,19 @@ def process_site_logs(site, lookback_hours=DEFAULT_LOOKBACK_HOURS, event_filters
 def prompt_user_filters():
     print("""
 ============================================================
- 🕒 STEP 1: KITNE TIME (HOURS) KA LOGS DATA CHAHIYE?
+ 🕒 STEP 1: SELECT LOG LOOKBACK TIME WINDOW
 ============================================================
- [1] Pichle 1 Ghante  (1 Hour)
- [2] Pichle 3 Ghante  (3 Hours)
- [3] Pichle 5 Ghante  (5 Hours) - [Default]
- [4] Pichle 12 Ghante (12 Hours)
- [5] Pichle 24 Ghante (1 Day)
- [6] Pichle 48 Ghante (2 Days)
- [7] Pichle 7 Din     (7 Days)
- [8] Custom Hours enter karein
+ [1] Past 1 Hour
+ [2] Past 3 Hours
+ [3] Past 5 Hours  - [Default]
+ [4] Past 12 Hours
+ [5] Past 24 Hours (1 Day)
+ [6] Past 48 Hours (2 Days)
+ [7] Past 7 Days
+ [8] Custom Hours Input
 """)
     try:
-        t_choice = input("Choice daalein (1-8) [Default: 3]: ").strip()
+        t_choice = input("Enter Choice (1-8) [Default: 3]: ").strip()
     except (EOFError, KeyboardInterrupt):
         t_choice = "3"
 
@@ -733,30 +754,30 @@ def prompt_user_filters():
 
     if t_choice == "8":
         try:
-            val = input("Kitne hours ka data chahiye? (e.g. 10): ").strip()
+            val = input("Enter number of hours (e.g. 10): ").strip()
             hours = int(val) if val.isdigit() else DEFAULT_LOOKBACK_HOURS
         except Exception:
             hours = DEFAULT_LOOKBACK_HOURS
     else:
         hours = hours_map.get(t_choice, DEFAULT_LOOKBACK_HOURS)
 
-    print(f"-> Selected: Pichle {hours} Ghante\n")
+    print(f"-> Selected: Past {hours} Hours\n")
 
     print("""
 ============================================================
- 🎯 STEP 2: KAUN KAUN SE EVENTS KA DATA CHAHIYE?
+ 🎯 STEP 2: SELECT EVENT FILTER
 ============================================================
- [1] All Events (Saare Logs) - [Default]
+ [1] All Events (Full DVR Logs) - [Default]
  [2] 🚨 Motion Detection (Motion Start / Stop / MD)
  [3] ⚠️ Network Disconnects (Net Broken / LAN / Disconnect)
  [4] 👤 User Login / Operations (Admin logins, Settings, Account)
  [5] 💾 Hard Disk & System Health (S.M.A.R.T Info / Storage / Disk)
  [6] 📹 Video Loss / Camera Tampering / Blind Detect
  [7] ❌ System Exceptions (All Exception Errors & Alarms)
- [8] Multiple Choice / Custom Filter (e.g. 2,3,5)
+ [8] Multiple Selection / Custom Filter (e.g. 2,3,5)
 """)
     try:
-        e_choice = input("Choice daalein (1-8) [Default: 1]: ").strip()
+        e_choice = input("Enter Choice (1-8) [Default: 1]: ").strip()
     except (EOFError, KeyboardInterrupt):
         e_choice = "1"
 
@@ -777,7 +798,7 @@ def prompt_user_filters():
         events = ["exception"]
     elif e_choice == "8":
         try:
-            custom_in = input("Enter multiple options (e.g. 2,3,5) ya keywords: ").strip()
+            custom_in = input("Enter multiple options (e.g. 2,3,5) or keywords: ").strip()
             num_map = {
                 "2": "motion",
                 "3": "network",
@@ -803,20 +824,20 @@ def prompt_user_filters():
 
     print("""
 ============================================================
- 📍 STEP 3: KIS SITE KE LIYE CHALANA HAI?
+ 📍 STEP 3: SELECT TARGET SITE MODE
 ============================================================
- [1] Sabhi CP Plus & Dahua Sites (Batch Sync) - [Default]
- [2] Single IP Test Karein
+ [1] All CP Plus & Dahua Sites (Batch Sync) - [Default]
+ [2] Single IP Test Mode
 """)
     try:
-        s_choice = input("Choice daalein (1-2) [Default: 1]: ").strip()
+        s_choice = input("Enter Choice (1-2) [Default: 1]: ").strip()
     except (EOFError, KeyboardInterrupt):
         s_choice = "1"
 
     target_ip = None
     if s_choice == "2":
         try:
-            target_ip = input("Enter DVR IP address (e.g. 172.17.17.44): ").strip()
+            target_ip = input("Enter DVR IP address (e.g. 172.17.15.37): ").strip()
         except Exception:
             target_ip = None
 
@@ -829,29 +850,28 @@ def prompt_user_filters():
 
 def main():
     parser = argparse.ArgumentParser(description="CP Plus & Dahua DVR Log Fetcher & DB Sync")
-    parser.add_argument("--ip", "-i", type=str, help="Target a specific DVR IP address (e.g. --ip 172.17.17.44)")
-    parser.add_argument("--hours", "-H", type=int, help="Lookback hours to fetch (e.g. --hours 6)")
+    parser.add_argument("--ip", "-i", type=str, default=TARGET_IP, help="Target a specific DVR IP address")
+    parser.add_argument("--hours", "-H", type=int, default=LOOKBACK_HOURS, help=f"Lookback hours to fetch (default: {LOOKBACK_HOURS})")
     parser.add_argument("--events", "-e", type=str, help="Event filter comma-separated (e.g. --events motion,network,login,hdd,all)")
     parser.add_argument("--limit", "-l", type=int, default=DEFAULT_MAX_RECORDS, help=f"Max log records to fetch (default: {DEFAULT_MAX_RECORDS})")
-    parser.add_argument("--auto", "-a", action="store_true", help="Run automatically in scheduler mode without interactive prompts")
-    parser.add_argument("--menu", "-m", action="store_true", help="Open interactive selection menu")
+    parser.add_argument("--auto", "-a", action="store_true", default=ENABLE_AUTO_SCHEDULER, help="Run automatically in scheduler mode")
+    parser.add_argument("--menu", "-m", action="store_true", default=ENABLE_INTERACTIVE_MENU, help="Open interactive selection menu")
     args = parser.parse_args()
 
     init_log_database()
 
-    # Determine execution mode
-    hours = args.hours
-    events = [e.strip().lower() for e in args.events.split(",")] if args.events else None
-    target_ip = args.ip.strip() if args.ip else None
-
-    # Check if we should show the interactive menu
-    if (args.menu or (not args.auto and not args.ip and not args.hours and not args.events and sys.stdin.isatty())):
-        hours, events, target_ip = prompt_user_filters()
+    # Determine execution settings from CLI or Config
+    hours = args.hours if args.hours is not None else LOOKBACK_HOURS
+    if args.events:
+        events = [e.strip().lower() for e in args.events.split(",")]
     else:
-        if hours is None:
-            hours = DEFAULT_LOOKBACK_HOURS
-        if events is None:
-            events = ["all"]
+        events = EVENT_FILTERS or ["all"]
+    target_ip = args.ip.strip() if args.ip else TARGET_IP
+    auto_loop = args.auto
+
+    # Show interactive menu ONLY if explicitly requested via config or --menu
+    if args.menu and sys.stdin.isatty():
+        hours, events, target_ip = prompt_user_filters()
 
     # SINGLE IP MODE
     if target_ip:
@@ -871,13 +891,16 @@ def main():
 
     # BATCH SCHEDULER MODE (All Sites)
     filter_label = ", ".join(events) if events else "All Events"
+    cycle_num = 1
+
     while True:
         start_time = datetime.now()
         start_str = start_time.strftime("%Y-%m-%d %H:%M:%S")
 
         safe_print("\n" + "=" * 70)
-        safe_print(f"🚀 SCHEDULED CP PLUS / DAHUA DVR LOG FETCH CYCLE STARTED AT {start_str}")
+        safe_print(f"🚀 [CYCLE #{cycle_num}] CP PLUS / DAHUA DVR LOG FETCH STARTED AT {start_str}")
         safe_print(f"🕒 Lookback: Last {hours} Hours | 🎯 Events Filter: {filter_label}")
+        safe_print(f"⏱️ Schedule Interval: Every {SCHEDULER_INTERVAL_HOURS} Hours | 🔁 Auto-Loop: {'ON' if auto_loop else 'OFF'}")
         safe_print("=" * 70 + "\n")
 
         sites = get_cpplus_dahua_sites()
@@ -907,7 +930,7 @@ def main():
 
             safe_print("\n".join([
                 "\n" + "=" * 70,
-                "📊 CP PLUS / DAHUA LOG EXTRACTION CYCLE SUMMARY",
+                f"📊 [CYCLE #{cycle_num}] CP PLUS / DAHUA LOG EXTRACTION SUMMARY",
                 "=" * 70,
                 f"  ⏱️  Started At     : {start_str}",
                 f"  ⏱️  Finished At    : {end_time.strftime('%Y-%m-%d %H:%M:%S')} (Duration: {duration}s)",
@@ -915,17 +938,20 @@ def main():
                 f"  🟢 Sync Completed : {succ} DVRs",
                 f"  🔴 Sync Failed    : {fail} DVRs",
                 "=" * 70,
-                f"  ⏳ Next log sync at: {next_run}",
+                f"  ⏳ Next log sync at: {next_run} (after {SCHEDULER_INTERVAL_HOURS} hours)",
                 "=" * 70 + "\n",
             ]))
 
-        if not args.auto and not (args.hours or args.events):
-            # If user ran a single batch from terminal, finish cleanly
+        # If user disabled auto scheduler, exit after 1 cycle
+        if not auto_loop:
+            safe_print("ℹ️ Auto-scheduler is OFF. Completed single batch sync.")
             break
 
         elapsed = (datetime.now() - start_time).total_seconds()
         sleep_for = max(60, CYCLE_SLEEP_SECONDS - elapsed)
-        safe_print(f"😴 Sleeping for {int(sleep_for)}s ...\n")
+        safe_print(f"😴 Sleeping for {int(sleep_for)}s ({round(sleep_for/3600, 2)} hrs) until next automated cycle...\n")
+        
+        cycle_num += 1
         time.sleep(sleep_for)
 
 

@@ -139,6 +139,7 @@ def init_log_database():
         id INT AUTO_INCREMENT PRIMARY KEY,
         ipaddress VARCHAR(50) NOT NULL,
         atmid VARCHAR(50) DEFAULT NULL,
+        dvrname VARCHAR(100) DEFAULT NULL,
         log_time DATETIME NOT NULL,
         major_type VARCHAR(100) DEFAULT NULL,
         minor_type VARCHAR(100) DEFAULT NULL,
@@ -151,6 +152,7 @@ def init_log_database():
         INDEX idx_log_time (log_time),
         INDEX idx_ipaddress (ipaddress),
         INDEX idx_atmid (atmid),
+        INDEX idx_dvrname (dvrname),
         INDEX idx_major_type (major_type)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """
@@ -159,6 +161,8 @@ def init_log_database():
     try:
         cols_info = db_execute("DESCRIBE dvr_fetched_logs;", fetch=True)
         existing_cols = [c['Field'] for c in cols_info] if cols_info else []
+        if "dvrname" not in existing_cols:
+            db_execute("ALTER TABLE dvr_fetched_logs ADD COLUMN dvrname VARCHAR(100) DEFAULT NULL AFTER atmid;")
         if "user_name" not in existing_cols:
             db_execute("ALTER TABLE dvr_fetched_logs ADD COLUMN user_name VARCHAR(50) DEFAULT NULL AFTER source_ip;")
         if "raw_meta_id" not in existing_cols:
@@ -176,31 +180,38 @@ def init_log_database():
 # ==================================================================== #
 
 def get_hikvision_sites(target_ip=None):
+    """Fetches Hikvision sites from database tables."""
     if target_ip:
         sites = db_execute("""
-            SELECT SN, atmid, ipaddress, port, username, password
+            SELECT SN, atmid, IPAddress AS ipaddress, port, UserName AS username, Password AS password, dvrname
             FROM all_dvr_live
-            WHERE ipaddress = %s
+            WHERE IPAddress = %s
         """, (target_ip,), fetch=True)
         if not sites:
             sites = db_execute("""
-                SELECT SN, atmid, ipaddress, port, username, password
-                FROM sites_safe
-                WHERE ipaddress = %s
+                SELECT SN, ATMID AS atmid, DVRIP AS ipaddress, COALESCE(dvr_port, router_port, 81) AS port, UserName AS username, Password AS password, DVRName AS dvrname
+                FROM sites
+                WHERE DVRIP = %s
             """, (target_ip,), fetch=True)
         return sites or []
 
     sites = db_execute("""
-        SELECT SN, atmid, ipaddress, port, username, password
+        SELECT SN, atmid, IPAddress AS ipaddress, port, UserName AS username, Password AS password, dvrname
         FROM all_dvr_live
-        WHERE dvrname = 'hikvision' AND live = 'Y'
+        WHERE LOWER(dvrname) LIKE '%hikvision%' 
+          AND IPAddress IS NOT NULL 
+          AND TRIM(IPAddress) != ''
+          AND live = 'Y'
     """, fetch=True)
 
     if not sites:
         sites = db_execute("""
-            SELECT SN, atmid, ipaddress, port, username, password
-            FROM sites_safe
-            WHERE dvrname = 'hikvision' AND live = 'Y'
+            SELECT SN, ATMID AS atmid, DVRIP AS ipaddress, COALESCE(dvr_port, router_port, 81) AS port, UserName AS username, Password AS password, DVRName AS dvrname
+            FROM sites
+            WHERE LOWER(DVRName) LIKE '%hikvision%' 
+              AND DVRIP IS NOT NULL 
+              AND TRIM(DVRIP) != ''
+              AND live = 'Y'
         """, fetch=True)
     return sites or []
 
@@ -465,11 +476,14 @@ def build_log_card(ip, atm_id, status, message, fetched_count=0, saved_count=0):
 
 
 def process_site_logs(site, lookback_hours=DEFAULT_LOOKBACK_HOURS, event_filters=None, max_records=DEFAULT_MAX_RECORDS, is_single=False):
-    ip = site.get("ipaddress")
+    ip = str(site.get("ipaddress") or "").strip()
+    if not ip:
+        return False
     port = site.get("port") or 81
     user = site.get("username")
     pwd = site.get("password")
     atm_id = str(site.get("atmid", "") or "").replace(" ", "")
+    dvr_name = str(site.get("dvrname") or "HIKVISION").strip()
 
     fetcher = HikvisionLogFetcher(ip, port, user, pwd)
     
@@ -497,11 +511,12 @@ def process_site_logs(site, lookback_hours=DEFAULT_LOOKBACK_HOURS, event_filters
         if logs_list:
             insert_sql = """
                 INSERT IGNORE INTO dvr_fetched_logs 
-                (ipaddress, atmid, log_time, major_type, minor_type, description, source_ip, user_name, raw_meta_id, raw_xml)
-                VALUES (%(ipaddress)s, %(atmid)s, %(log_time)s, %(major_type)s, %(minor_type)s, %(description)s, %(source_ip)s, %(user_name)s, %(raw_meta_id)s, %(raw_xml)s)
+                (ipaddress, atmid, dvrname, log_time, major_type, minor_type, description, source_ip, user_name, raw_meta_id, raw_xml)
+                VALUES (%(ipaddress)s, %(atmid)s, %(dvrname)s, %(log_time)s, %(major_type)s, %(minor_type)s, %(description)s, %(source_ip)s, %(user_name)s, %(raw_meta_id)s, %(raw_xml)s)
             """
             for log in logs_list:
                 log["atmid"] = atm_id
+                log["dvrname"] = dvr_name
 
             saved_count = db_execute(insert_sql, logs_list, many=True)
 

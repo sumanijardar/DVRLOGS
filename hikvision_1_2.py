@@ -48,7 +48,7 @@ ENABLE_AUTO_SCHEDULER    = True     # 🔁 True = Run continuously on schedule, 
 SCHEDULER_INTERVAL_HOURS = 2        # ⏱️ Run synchronization cycle every 2 Hours (7200s)
 
 # 2. Lookback Window: Number of past hours of logs to fetch from DVR
-LOOKBACK_HOURS           = 2        # 🕒 Fetch logs from the last 2 Hours (e.g. 2, 5, 24, 72)
+LOOKBACK_HOURS           = 2       # 🕒 Fetch logs from the last 2 Hours (e.g. 2, 5, 24, 72)
 DEFAULT_LOOKBACK_HOURS   = LOOKBACK_HOURS
 
 # 3. Event Types to Fetch:

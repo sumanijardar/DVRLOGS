@@ -1,0 +1,159 @@
+CPPLUS & DHUVA
+
+
+Boot Up
+Hdd
+Motion Detection
+Net Disconnection
+Network Disconnection Event
+S.M.A.R.T
+S.M.A.R.T Info
+Save Config
+Shut Down
+Tampering
+User Logged In.
+User Logged Out.
+User Logout
+Video Loss
+Video Tampering
+
+
+
+
+
+Hikvision
+
+Alarm
+Exception
+Infomation
+Operation
+
+EVENT TYPE
+ 
+ 	
+minor_type  ((HIKVISION))
+
+
+Run Status Info
+Smart Info - Channel 1
+Timing
+Motion Start - Channel 1
+Motion Stop - Channel 1
+Motion Start - Channel 2
+Motion Stop - Channel 2
+Hide Start - Channel 2
+Hide Stop - Channel 2
+Stop Rec - Channel 1
+Stop Rec - Channel 2
+Stop Rec - Channel 3
+Start Rec - Channel 1
+Start Rec - Channel 2
+Start Rec - Channel 3
+Motion Stop - Channel 3
+Motion Start - Channel 3
+Motion Start - Channel 4
+Motion Stop - Channel 4
+Hide Start - Channel 3
+Hide Stop - Channel 3
+Stop Abnormal
+Hdd Info - Channel 1
+Data Reconstruction Start
+Data Reconstruction Stop
+Device Power On
+Net Broken
+Video Lost - Channel 3
+Remote Login
+Remote Play By Time - Channel 1
+Illlegeal Access
+Remote Cfg Para
+Remote Power Recycle
+Ezviz Run Status Info
+Ezviz Offline
+Stop Rec - Channel 5
+Ipc Disconnect - Channel 5
+Start Rec - Channel 5
+Hide Start - Channel 4
+Hide Stop - Channel 4
+Motion Stop - Channel 5
+Motion Start - Channel 5
+Ipc Connect Status
+Ipc Connect
+Local Cfg Para - Channel 5
+Start Rec - Channel 4
+Start Pic
+Stop Pic
+Video Lost - Channel 4
+Video Lost - Channel 1
+Local Add Ipc
+Hide Start - Channel 1
+Hide Stop - Channel 1
+Video Lost - Channel 2
+Stop Rec - Channel 6
+Ipc Disconnect - Channel 6
+Start Rec - Channel 6
+Local Cfg Para - Channel 6
+
+
+UNIVIEW (UNV)
+
+major_type ((UNIVIEW))
+Alarm
+Exception
+Operation
+Information
+
+minor_type ((UNIVIEW))
+Login
+Logout
+Device Power On
+Device Shutdown
+Device Reboot
+Parameter Configuration
+Start Recording
+Stop Recording
+Modify User
+Tampering Detection Started
+Tampering Detection Ended
+Motion Detection Started
+Motion Detection Ended
+Video Loss Started
+Video Loss Ended
+Network Disconnected
+Network Connected
+HDD Info
+HDD Full
+HDD Error
+Disk SMART Error
+
+
+
+
+Request URL
+http://172.17.7.59:81/LAPI/V1.0/System/Private/Logs
+Request method
+POST
+Status code
+200 OK
+Remote address
+172.17.7.59:81
+Referrer policy
+strict-origin-when-cross-origin
+
+Response
+: 
+{ResponseURL: "/LAPI/V1.0/System/Private/Logs", ResponseCode: 0, ResponseString: "Succeed",…}
+Data
+: 
+{Num: 20, Total: 20,…}
+ResponseCode
+: 
+0
+ResponseString
+: 
+"Succeed"
+ResponseURL
+: 
+"/LAPI/V1.0/System/Private/Logs"
+StatusCode
+: 
+0

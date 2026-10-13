@@ -34,6 +34,8 @@ import requests
 from requests.auth import HTTPDigestAuth, HTTPBasicAuth
 from ping3 import ping
 
+import json
+import hashlib
 import pymysql
 from pymysql.cursors import DictCursor
 from dbutils.pooled_db import PooledDB
@@ -292,6 +294,78 @@ def parse_dahua_type(type_val: str):
     return t_clean.title()
 
 
+def parse_dahua_rpc_records(items: list, ip: str):
+    """
+    Parses structured JSON records returned by Dahua / CP Plus Web 3.0 RPC endpoint (log.doSeekFind).
+    Supports translated items containing Time, Type, Detail, and User fields.
+    """
+    parsed_records = []
+    for item in items:
+        time_val = item.get("Time") or item.get("time") or ""
+        type_val = item.get("Type") or item.get("type") or "General"
+        user_val = item.get("User") or item.get("user") or ""
+        detail_val = item.get("Detail") or item.get("detail") or ""
+
+        # Extract Source IP from Detail if present
+        source_ip = ""
+        m_ip = re.search(r"ip\s*address\s*:\s*([\d\.]+)", detail_val, re.IGNORECASE)
+        if m_ip:
+            source_ip = m_ip.group(1).strip()
+
+        # Extract Username from Detail if not in item
+        if not user_val:
+            m_u = re.search(r"username\s*:\s*(\S+)", detail_val, re.IGNORECASE)
+            if m_u:
+                user_val = m_u.group(1).strip()
+
+        # Channel extraction
+        m_ch = re.search(r"channel\s*:\s*<(\d+)>", detail_val, re.IGNORECASE)
+        channel_str = f"Channel {m_ch.group(1)}" if m_ch else ""
+
+        # Event action extraction
+        m_act = re.search(r"event\s*action\s*:\s*([^\n\r]+)", detail_val, re.IGNORECASE)
+        action_str = m_act.group(1).strip() if m_act else ""
+
+        # Major category normalization
+        t_lower = type_val.lower()
+        t_nodots = t_lower.replace(".", "")
+        if any(k in t_nodots for k in ["login", "logged", "logout", "user", "account"]):
+            major = "Account"
+        elif any(k in t_nodots for k in ["video", "motion", "alarm", "blind", "tamper"]):
+            major = "Alarm"
+        elif any(k in t_nodots for k in ["smart", "disk", "storage", "hdd"]):
+            major = "Storage"
+        elif any(k in t_nodots for k in ["system", "reboot", "shutdown", "startup"]):
+            major = "System"
+        elif "config" in t_nodots:
+            major = "Config"
+        else:
+            major = type_val
+
+        minor_parts = [type_val]
+        if channel_str:
+            minor_parts.append(channel_str)
+        if action_str and action_str.lower() not in type_val.lower():
+            minor_parts.append(action_str)
+        minor = " - ".join(minor_parts)
+
+        desc = detail_val.strip() if detail_val.strip() else type_val
+        cleaned_time = clean_log_time(time_val)
+
+        if cleaned_time:
+            parsed_records.append({
+                "ipaddress": ip,
+                "log_time": cleaned_time,
+                "major_type": major,
+                "minor_type": minor,
+                "description": desc,
+                "source_ip": source_ip,
+                "user_name": user_val,
+                "raw_xml": json.dumps(item, ensure_ascii=False)
+            })
+    return parsed_records
+
+
 def parse_dahua_log_records(res_text: str, ip: str):
     """
     Parses key-value and multiline responses from Dahua / CP Plus log.cgi endpoint.
@@ -422,7 +496,8 @@ def matches_event_filter(record: dict, filter_keywords: list) -> bool:
             if "login" in text_corpus or "user" in text_corpus or "account" in text_corpus or "operation" in text_corpus or "admin" in text_corpus or "cfg" in text_corpus or "config" in text_corpus:
                 return True
         elif ef_clean in ["hdd", "disk", "smart", "smart info", "storage", "health", "status"]:
-            if "smart" in text_corpus or "disk" in text_corpus or "hdd" in text_corpus or "storage" in text_corpus or "run status" in text_corpus:
+            corpus_nodots = text_corpus.replace(".", "")
+            if "smart" in corpus_nodots or "disk" in text_corpus or "hdd" in text_corpus or "storage" in text_corpus or "run status" in text_corpus:
                 return True
         elif ef_clean in ["video_loss", "videoloss", "tamper", "tampering", "video", "blind"]:
             if "video loss" in text_corpus or "videoloss" in text_corpus or "tamper" in text_corpus or "blind" in text_corpus:
@@ -510,17 +585,212 @@ class CPPlusDahuaLogFetcher:
         except Exception:
             return False
 
-    def fetch_logs(self, start_time_dt, end_time_dt, event_filters=None, max_records=DEFAULT_MAX_RECORDS):
+    def fetch_logs_rpc(self, start_time_dt, end_time_dt, event_filters=None, max_records=DEFAULT_MAX_RECORDS):
         """
-        Fetches logs from CP Plus / Dahua DVR using Dahua HTTP CGI log API:
-        1. startFind -> returns session token
-        2. doFind -> fetches chunk of records
-        3. stopFind -> releases session token
+        Fetches logs from CP Plus / Dahua Web 3.0 devices using Dahua JSON-RPC API (/RPC2_Login & /RPC2).
+        Required for newer XVR/NVR models where legacy log.cgi returns count=0.
         """
         start_str = start_time_dt.strftime("%Y-%m-%d %H:%M:%S")
         end_str = end_time_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-        # 1. Initiate search via startFind (condition.Type=0 is required for Dahua/CP Plus to query all event types)
+        session_val = None
+        token = None
+        records = []
+
+        try:
+            # 1. Step 1: Login challenge request
+            r1 = self.session.post(
+                f"{self.base_url}/RPC2_Login",
+                json={
+                    "method": "global.login",
+                    "params": {
+                        "userName": self.username,
+                        "password": "",
+                        "clientType": "Web3.0"
+                    },
+                    "id": 1,
+                    "session": 0
+                },
+                timeout=T_LOG_FETCH
+            )
+
+            if r1.status_code == 404:
+                return False, "RPC Endpoint Not Found", []
+
+            if r1.status_code != 200:
+                return False, f"RPC Login Challenge Failed (HTTP {r1.status_code})", []
+
+            d1 = r1.json()
+            err_info = d1.get("error", {})
+            params1 = d1.get("params", {})
+            session_val = d1.get("session")
+
+            # Check if challenged (268632079 = Dahua login challenge code)
+            if err_info.get("code") != 268632079 or not session_val:
+                return False, "Not an RPC Challenge Device", []
+
+            random_val = params1.get("random", "")
+            realm_val = params1.get("realm", "")
+
+            # 2. Step 2: Dahua MD5 Challenge Authentication
+            # o = hex_md5(username + ":" + realm + ":" + password).toUpperCase()
+            # enc_pwd = hex_md5(username + ":" + random + ":" + o).toUpperCase()
+            o_hash = hashlib.md5(f"{self.username}:{realm_val}:{self.password}".encode()).hexdigest().upper()
+            enc_pwd = hashlib.md5(f"{self.username}:{random_val}:{o_hash}".encode()).hexdigest().upper()
+
+            r2 = self.session.post(
+                f"{self.base_url}/RPC2_Login",
+                json={
+                    "method": "global.login",
+                    "params": {
+                        "userName": self.username,
+                        "password": enc_pwd,
+                        "clientType": "Web3.0",
+                        "authorityType": "Default",
+                        "passwordType": "Default"
+                    },
+                    "id": 2,
+                    "session": session_val
+                },
+                timeout=T_LOG_FETCH
+            )
+
+            if r2.status_code != 200 or not r2.json().get("result"):
+                return False, "Invalid Username/Password (RPC)", []
+
+            # 3. Map event filters to RPC condition Types
+            if not event_filters or "all" in [f.lower() for f in event_filters] or "*" in event_filters:
+                rpc_types = ["System", "Config", "Storage", "Data", "Account", "ClearLog", "File", "Event", "RemoteDevice"]
+            else:
+                rpc_types = []
+                for ef in event_filters:
+                    ef_clean = ef.strip().lower()
+                    if ef_clean in ["login", "user_login", "auth", "user", "account", "operation"]:
+                        rpc_types.append("Account")
+                    elif ef_clean in ["motion", "motion_detection", "video_loss", "videoloss", "tamper", "alarm", "event", "blind"]:
+                        rpc_types.append("Event")
+                    elif ef_clean in ["hdd", "disk", "smart", "storage"]:
+                        rpc_types.append("Storage")
+                    elif ef_clean in ["system", "reboot", "shutdown"]:
+                        rpc_types.append("System")
+                    elif ef_clean in ["config", "cfg"]:
+                        rpc_types.append("Config")
+                    elif ef_clean in ["network", "net", "lan"]:
+                        rpc_types.extend(["Event", "System", "RemoteDevice"])
+                rpc_types = list(set(rpc_types)) if rpc_types else ["System", "Config", "Storage", "Data", "Account", "ClearLog", "File", "Event", "RemoteDevice"]
+
+            # 4. Initiate RPC search (log.startFind)
+            r3 = self.session.post(
+                f"{self.base_url}/RPC2",
+                json={
+                    "method": "log.startFind",
+                    "params": {
+                        "condition": {
+                            "Types": rpc_types,
+                            "StartTime": start_str,
+                            "EndTime": end_str,
+                            "Translate": True
+                        }
+                    },
+                    "id": 3,
+                    "session": session_val
+                },
+                timeout=T_LOG_FETCH
+            )
+
+            if r3.status_code != 200:
+                return False, "RPC log.startFind Failed", []
+
+            token = r3.json().get("params", {}).get("token")
+            if token is None:
+                return False, "RPC Token Not Received", []
+
+            # 5. Query total log count (log.getCount)
+            r4 = self.session.post(
+                f"{self.base_url}/RPC2",
+                json={
+                    "method": "log.getCount",
+                    "params": {"token": token},
+                    "id": 4,
+                    "session": session_val
+                },
+                timeout=T_LOG_FETCH
+            )
+
+            total_count = r4.json().get("params", {}).get("count", 0) if r4.status_code == 200 else 0
+
+            # 6. Fetch chunks using log.doSeekFind
+            chunk_size = 100
+            offset = 0
+            req_id = 5
+
+            while offset < total_count and len(records) < max_records:
+                fetch_n = min(chunk_size, total_count - offset, max_records - len(records))
+                r_seek = self.session.post(
+                    f"{self.base_url}/RPC2",
+                    json={
+                        "method": "log.doSeekFind",
+                        "params": {
+                            "token": token,
+                            "offset": offset,
+                            "count": fetch_n
+                        },
+                        "id": req_id,
+                        "session": session_val
+                    },
+                    timeout=T_LOG_FETCH
+                )
+                req_id += 1
+
+                if r_seek.status_code != 200:
+                    break
+
+                items = r_seek.json().get("params", {}).get("items", [])
+                if not items:
+                    break
+
+                chunk_records = parse_dahua_rpc_records(items, self.ip)
+                for rec in chunk_records:
+                    if event_filters and not matches_event_filter(rec, event_filters):
+                        continue
+                    records.append(rec)
+                    if len(records) >= max_records:
+                        break
+
+                offset += len(items)
+
+            return True, "Success", records[:max_records]
+
+        except Exception as e:
+            return False, str(e), []
+        finally:
+            # 7. Release search token and logout
+            if token and session_val:
+                try:
+                    self.session.post(
+                        f"{self.base_url}/RPC2",
+                        json={"method": "log.stopFind", "params": {"token": token}, "id": 99, "session": session_val},
+                        timeout=3
+                    )
+                except Exception:
+                    pass
+            if session_val:
+                try:
+                    self.session.post(
+                        f"{self.base_url}/RPC2",
+                        json={"method": "global.logout", "params": None, "id": 100, "session": session_val},
+                        timeout=3
+                    )
+                except Exception:
+                    pass
+
+    def fetch_logs_cgi(self, start_time_dt, end_time_dt, event_filters=None, max_records=DEFAULT_MAX_RECORDS):
+        """
+        Legacy CGI fallback for older CP Plus / Dahua DVR models using HTTP CGI log API.
+        """
+        start_str = start_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+        end_str = end_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+
         start_url = f"{self.base_url}/cgi-bin/log.cgi"
         start_params = {
             "action": "startFind",
@@ -535,12 +805,10 @@ class CPPlusDahuaLogFetcher:
         try:
             r = self.session.get(start_url, params=start_params, timeout=T_LOG_FETCH)
             
-            # If 401 with Digest, try Basic Auth fallback
             if r.status_code == 401:
                 self.session.auth = HTTPBasicAuth(self.username, self.password)
                 r = self.session.get(start_url, params=start_params, timeout=T_LOG_FETCH)
 
-            # If 400 Bad Request without condition.Type, try without condition.Type as fallback
             if r.status_code == 400:
                 alt_params = {
                     "action": "startFind",
@@ -552,10 +820,8 @@ class CPPlusDahuaLogFetcher:
             if r.status_code != 200:
                 return False, format_http_error(r.status_code), []
 
-            # Extract token=123 from response
             token_match = re.search(r"token\s*=\s*([0-9a-zA-Z_-]+)", r.text, re.IGNORECASE)
             if not token_match:
-                # Direct getLog fallback if startFind unsupported
                 return self._fallback_get_log(event_filters, max_records)
 
             token = token_match.group(1).strip()
@@ -565,7 +831,6 @@ class CPPlusDahuaLogFetcher:
         except Exception as e:
             return False, str(e), []
 
-        # 2. Iterate doFind chunks
         try:
             chunk_size = 100
             while len(records) < max_records:
@@ -590,7 +855,6 @@ class CPPlusDahuaLogFetcher:
                     if len(records) >= max_records:
                         break
 
-                # Check if search completed
                 found_match = re.search(r"found\s*=\s*(\d+)", res_text, re.IGNORECASE)
                 found_count = int(found_match.group(1)) if found_match else len(chunk_records)
                 if found_count == 0 or len(chunk_records) < chunk_size:
@@ -600,7 +864,6 @@ class CPPlusDahuaLogFetcher:
             if not records:
                 return False, str(e), []
         finally:
-            # 3. Clean up search session with stopFind
             if token:
                 try:
                     self.session.get(start_url, params={"action": "stopFind", "token": token}, timeout=5)
@@ -608,6 +871,22 @@ class CPPlusDahuaLogFetcher:
                     pass
 
         return True, "Success", records[:max_records]
+
+    def fetch_logs(self, start_time_dt, end_time_dt, event_filters=None, max_records=DEFAULT_MAX_RECORDS):
+        """
+        Unified fetcher: Tries modern Web 3.0 JSON-RPC API first, then falls back to legacy CGI API.
+        """
+        # 1. Try modern JSON-RPC protocol first (for Web 3.0 / XVR / modern CP Plus & Dahua)
+        rpc_ok, rpc_msg, rpc_records = self.fetch_logs_rpc(start_time_dt, end_time_dt, event_filters=event_filters, max_records=max_records)
+        if rpc_ok:
+            return True, "Success", rpc_records
+
+        # If RPC explicitly failed authentication, return error directly
+        if "Invalid Username/Password" in rpc_msg:
+            return False, rpc_msg, []
+
+        # 2. Fallback to legacy CGI API for older models
+        return self.fetch_logs_cgi(start_time_dt, end_time_dt, event_filters=event_filters, max_records=max_records)
 
     def _fallback_get_log(self, event_filters, max_records):
         """Fallback for older CP Plus / Dahua models supporting single-shot getLog action."""
@@ -705,9 +984,11 @@ def process_site_logs(site, lookback_hours=DEFAULT_LOOKBACK_HOURS, event_filters
             for idx, item in enumerate(logs_list, 1):
                 dt = str(item.get('log_time', ''))[:19]
                 cat = str(item.get('major_type', ''))[:12]
-                u = str(item.get('user_name', '') or '-')[:10]
-                ev = f"{item.get('minor_type', '')} - {item.get('description', '')}"[:55]
-                safe_print(f" {idx:<4} | {dt:<19} | {cat:<12} | {u:<10} | {ev:<55}")
+                u = str(item.get('user_name', '') or '-').strip()[:10]
+                desc_flat = " ".join(str(item.get('description', '')).split())
+                ev = f"{item.get('minor_type', '')} - {desc_flat}" if item.get('minor_type') != desc_flat else desc_flat
+                ev_clean = ev[:55]
+                safe_print(f" {idx:<4} | {dt:<19} | {cat:<12} | {u:<10} | {ev_clean:<55}")
             safe_print(f"{'='*110}\n")
 
         return True
